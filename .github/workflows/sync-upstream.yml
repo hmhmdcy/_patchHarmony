@@ -1,0 +1,71 @@
+name: Sync upstream
+
+# 让 fork 与上游 Dere3046/_patchHarmony 保持一比一，并在有更新时自动触发 Module zip
+# 触发方式：定时（每 6 小时）+ 手动
+# 需要两个仓库 secret（值可以同一个 PAT）：
+#   FORK_PAT     —— 用于 force-push 与触发 workflow（必须！GITHUB_TOKEN 触发不了新 run）
+#   KMSDK_TOKEN  —— 上游 module.yml/build.yml 拉依赖时要用（PAT 需能读公有仓库）
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.FORK_PAT }}
+
+      - name: Reset to upstream and push
+        id: sync
+        run: |
+          set -eu
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Dere3046/_patchHarmony.git 2>/dev/null || true
+          git fetch --quiet upstream main
+
+          if [ "$(git rev-list --count HEAD..upstream/main)" = "0" ]; then
+            echo "already up to date: $(git rev-parse --short HEAD)"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "upstream head: $(git rev-parse --short upstream/main)"
+          # 本文件上游没有，reset 会把它删掉，先备份
+          cp .github/workflows/sync-upstream.yml /tmp/sync-upstream.yml
+          git reset --hard upstream/main
+          cp /tmp/sync-upstream.yml .github/workflows/sync-upstream.yml
+
+          git add -A
+          git commit -q -m "sync: upstream $(git rev-parse --short upstream/main)" || true
+          git push --force origin main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Module zip
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          PAT: ${{ secrets.FORK_PAT }}
+        run: |
+          set -eu
+          code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/module.yml/dispatches" \
+            -d '{"ref":"main"}')
+          echo "dispatch: $code"; cat /tmp/resp.json || true
+          [ "$code" = "204" ] || exit 1
